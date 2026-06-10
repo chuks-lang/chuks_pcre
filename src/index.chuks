@@ -43,10 +43,12 @@ class Node {
     var escCls: string        // kind=esc shorthand: d D w W s S
     var backrefNum: int
     var backrefName: string
+    var ci: bool              // case-insensitive (from inline (?i) flags)
 
     constructor(kind: string) {
         this.kind = kind
         this.cp = 0
+        this.ci = false
         this.children = []
         this.child = null
         this.min = 0
@@ -74,6 +76,8 @@ class Parser {
     var _pos: int
     var _groupCount: int
     var _names: map[string]int   // named-group name → number
+    var _ci: bool                // current case-insensitive mode ((?i))
+    var _x: bool                 // current extended/verbose mode ((?x))
 
     constructor(pattern: string) {
         this._p = pattern
@@ -81,6 +85,20 @@ class Parser {
         this._pos = 0
         this._groupCount = 0
         this._names = {}
+        this._ci = false
+        this._x = false
+    }
+
+    // In extended/verbose mode, unescaped whitespace and `# … ` line comments in
+    // the pattern are ignored. Skip them between tokens (never inside [ … ]).
+    private skipX() {
+        if (!this._x) { return }
+        while (!this.eof()) {
+            var c: string = this.peek()
+            if (c == " " || c == "\t" || c == "\n" || c == "\r" || c == "\f") { this.next() }
+            else if (c == "#") { while (!this.eof() && this.peek() != "\n") { this.next() } }
+            else { break }
+        }
     }
 
     public groupCount(): int { return this._groupCount }
@@ -122,8 +140,10 @@ class Parser {
 
     private parseConcat(): Node {
         var items: []Node = []
+        this.skipX()
         while (!this.eof() && this.peek() != "|" && this.peek() != ")") {
             items.push(this.parseQuantified())
+            this.skipX()
         }
         if (items.length == 1) { return items[0] }
         var cat: Node = new Node("concat")
@@ -154,8 +174,12 @@ class Parser {
         }
 
         // Returns false if a lazy '?' follows (greedy=false), true otherwise.
+        // A possessive '+' (e.g. a++, a*+) is consumed and approximated as
+        // greedy — good enough for tokenization, since possessive only changes
+        // backtracking behavior, not the set of matches in practice here.
         private consumeLazy(): bool {
             if (this.peek() == "?") { this.next(); return false }
+            if (this.peek() == "+") { this.next(); return true }
             return true
         }
 
@@ -201,6 +225,7 @@ class Parser {
                 this.next()
                 var lit: Node = new Node("char")
                 lit.cp = strings.charCodeAt(c, 0)
+                lit.ci = this._ci
                 return lit
             }
 
@@ -215,10 +240,14 @@ class Parser {
                     var capturing: bool = true
                     var name: string = ""
                     var look: string = ""
+                    var savedCi: bool = this._ci
+                    var savedX: bool = this._x
+                    var restoreCi: bool = false
                     if (this.peek() == "?") {
                         this.next()
                         var c: string = this.peek()
                         if (c == ":") { this.next(); capturing = false }
+                        else if (c == ">") { this.next(); capturing = false }   // atomic group ≈ non-capturing
                         else if (c == "=") { this.next(); look = "ahead+" }
                         else if (c == "!") { this.next(); look = "ahead-" }
                         else if (c == "<") {
@@ -227,6 +256,32 @@ class Parser {
                             if (c2 == "=") { this.next(); look = "behind+" }
                             else if (c2 == "!") { this.next(); look = "behind-" }
                             else { name = this.readName(); capturing = true }
+                        } else if (c == "i" || c == "m" || c == "s" || c == "x" || c == "U" || c == "-") {
+                            // Inline flags: (?flags) sets them for the rest, (?flags:…) is
+                            // a scoped non-capturing group. We honor `i` (case-insensitive);
+                            // m/s/x/U are parsed and ignored.
+                            var negate: bool = false
+                            var ci: bool = this._ci
+                            var xf: bool = this._x
+                            while (true) {
+                                var f: string = this.peek()
+                                if (f == "-") { negate = true; this.next() }
+                                else if (f == "i") { ci = !negate; this.next() }
+                                else if (f == "x") { xf = !negate; this.next() }
+                                else if (f == "m" || f == "s" || f == "U") { this.next() }
+                                else { break }
+                            }
+                            if (this.peek() == ")") {
+                                this.next()
+                                this._ci = ci            // (?flags) — applies to the rest
+                                this._x = xf
+                                return new Node("concat") // zero-width, matches empty
+                            }
+                            if (this.peek() == ":") { this.next() }
+                            capturing = false
+                            this._ci = ci                // (?flags:…) — scoped
+                            this._x = xf
+                            restoreCi = true
                         } else {
                             throw new Error("regex: unsupported group '(?" + c + "'")
                             }
@@ -240,6 +295,7 @@ class Parser {
                         var body: Node = this.parseAlt()
                         if (this.peek() != ")") { throw new Error("regex: missing ')'") }
                 this.next()
+                if (restoreCi) { this._ci = savedCi; this._x = savedX }   // scoped (?flags:…) ends here
                 if (look != "") {
                     var l: Node = new Node("look")
                     l.child = body
@@ -278,6 +334,13 @@ class Parser {
                 if (c == "A") { this.next(); return this.anchor("\\A") }
                 if (c == "z") { this.next(); return this.anchor("\\z") }
                 if (c == "G") { this.next(); return this.anchor("\\G") }
+                // Hex / unicode escapes: \xHH, \x{H…}, \uHHHH.
+                if (c == "x" || c == "u") {
+                    var hx: Node = new Node("char")
+                    hx.cp = this.readHexEscape()
+                    hx.ci = this._ci
+                    return hx
+                }
                 // Named backreference \k<name>.
                 if (c == "k" && this.peekAt(1) == "<") {
                     this.next(); this.next()
@@ -297,7 +360,27 @@ class Parser {
                 this.next()
                 var lit: Node = new Node("char")
                 lit.cp = this.escCodepoint(c)
+                lit.ci = this._ci
                 return lit
+            }
+
+            // Reads a hex/unicode escape. Assumes peek() is 'x' or 'u'. Handles
+            // \xHH, \x{H…}, \uHHHH. A bare \x with no hex digits → literal 'x'.
+            private readHexEscape(): int {
+                var kind: string = this.next()   // 'x' or 'u'
+                if (kind == "x" && this.peek() == "{") {
+                    this.next()
+                    var h: string = ""
+                    while (!this.eof() && this.peek() != "}") { h = h + this.next() }
+                    if (this.peek() == "}") { this.next() }
+                    return parseHexStr(h)
+                }
+                var want: int = (kind == "u") ? 4 : 2
+                var hex: string = ""
+                var i: int = 0
+                while (i < want && !this.eof() && isHexDigit(this.peek())) { hex = hex + this.next(); i = i + 1 }
+                if (hex == "") { return strings.charCodeAt(kind, 0) }
+                return parseHexStr(hex)
             }
 
             private peekAt(off: int): string {
@@ -320,6 +403,7 @@ class Parser {
             private parseClass(): Node {
                 this.next() // '['
                     var node: Node = new Node("class")
+                    node.ci = this._ci
                     if (this.peek() == "^") { this.next(); node.negate = true }
                     var ranges: []int = []
                     var shorthands: []string = []
@@ -327,6 +411,10 @@ class Parser {
                 var first: bool = true
                 while (!this.eof() && (this.peek() != "]" || first)) {
                     first = false
+                    // POSIX bracket class, e.g. [:alnum:] inside [ … ].
+                    if (this.peek() == "[" && this.peekAt(1) == ":") {
+                        if (this.readPosixClass(ranges, shorthands)) { continue }
+                    }
                     var lo: int = this.readClassAtom(shorthands)
                     if (lo < 0) { continue }   // a shorthand was consumed
                     if (this.peek() == "-" && this.peekAt(1) != "]" && this.peekAt(1) != "") {
@@ -354,12 +442,45 @@ class Parser {
                 if (e == "d" || e == "D" || e == "w" || e == "W" || e == "s" || e == "S") {
                     this.next(); shorthands.push(e); return -1
                 }
+                if (e == "x" || e == "u") { return this.readHexEscape() }
                 this.next()
                 return this.escCodepoint(e)
             }
             this.next()
             return strings.charCodeAt(c, 0)
         }
+
+        // POSIX bracket class [:name:] inside a character class. Consumes it and
+        // appends the equivalent ASCII ranges/shorthands. Returns false (without
+        // consuming) if what follows isn't a well-formed [: … :].
+        private readPosixClass(ranges: []int, shorthands: []string): bool {
+            var save: int = this._pos
+            this.next(); this.next()   // consume "[:"
+            if (this.peek() == "^") { this.next() }   // negation not supported; treat as positive
+            var name: string = ""
+            while (!this.eof() && this.peek() != ":") { name = name + this.next() }
+            if (this.peek() != ":" || this.peekAt(1) != "]") { this._pos = save; return false }
+            this.next(); this.next()   // consume ":]"
+            if (name == "alpha") { pushRange(ranges, 65, 90); pushRange(ranges, 97, 122) }
+            else if (name == "alnum") { pushRange(ranges, 48, 57); pushRange(ranges, 65, 90); pushRange(ranges, 97, 122) }
+            else if (name == "digit") { pushRange(ranges, 48, 57) }
+            else if (name == "xdigit") { pushRange(ranges, 48, 57); pushRange(ranges, 65, 70); pushRange(ranges, 97, 102) }
+            else if (name == "upper") { pushRange(ranges, 65, 90) }
+            else if (name == "lower") { pushRange(ranges, 97, 122) }
+            else if (name == "space") { shorthands.push("s") }
+            else if (name == "blank") { pushRange(ranges, 32, 32); pushRange(ranges, 9, 9) }
+            else if (name == "word") { shorthands.push("w") }
+            else if (name == "punct") { pushRange(ranges, 33, 47); pushRange(ranges, 58, 64); pushRange(ranges, 91, 96); pushRange(ranges, 123, 126) }
+            else if (name == "cntrl") { pushRange(ranges, 0, 31); pushRange(ranges, 127, 127) }
+            else if (name == "print") { pushRange(ranges, 32, 126) }
+            else if (name == "graph") { pushRange(ranges, 33, 126) }
+            else { this._pos = save; return false }   // unknown POSIX name
+            return true
+        }
+    }
+
+    function pushRange(ranges: []int, lo: int, hi: int) {
+        ranges.push(lo); ranges.push(hi)
     }
 
     // ─── Match result ────────────────────────────────────────────────────────────
@@ -417,6 +538,38 @@ class Parser {
         return (cp >= 48 && cp <= 57) || (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122) || cp == 95
     }
 
+    function isHexDigit(c: string): bool {
+        return (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F")
+    }
+
+    // Parse a hex string (e.g. "7F", "1F600") into its integer value.
+    function parseHexStr(h: string): int {
+        var v: int = 0
+        for (var i: int = 0; i < h.length; i = i + 1) {
+            var c: string = strings.charAt(h, i)
+            var d: int = 0
+            if (c >= "0" && c <= "9") { d = strings.charCodeAt(c, 0) - 48 }
+            else if (c >= "a" && c <= "f") { d = strings.charCodeAt(c, 0) - 97 + 10 }
+            else if (c >= "A" && c <= "F") { d = strings.charCodeAt(c, 0) - 65 + 10 }
+            else { return v }
+            v = v * 16 + d
+        }
+        return v
+    }
+
+    // ASCII case fold: map A–Z to a–z so case-insensitive compares are cheap.
+    function foldCase(cp: int): int {
+        if (cp >= 65 && cp <= 90) { return cp + 32 }
+        return cp
+    }
+
+    // The other-case codepoint of an ASCII letter, or -1 if it has none.
+    function swapCase(cp: int): int {
+        if (cp >= 65 && cp <= 90) { return cp + 32 }
+        if (cp >= 97 && cp <= 122) { return cp - 32 }
+        return -1
+    }
+
     function matchesShorthand(cls: string, cp: int): bool {
         if (cls == "d") { return cp >= 48 && cp <= 57 }
         if (cls == "D") { return !(cp >= 48 && cp <= 57) }
@@ -427,18 +580,24 @@ class Parser {
         return false
     }
 
-    function classMatches(node: Node, cp: int): bool {
-        var hit: bool = false
+    function classMatchesRaw(node: Node, cp: int): bool {
         var r: []int = node.ranges
         var i: int = 0
         while (i < r.length) {
-            if (cp >= r[i] && cp <= r[i + 1]) { hit = true; break }
+            if (cp >= r[i] && cp <= r[i + 1]) { return true }
             i = i + 2
         }
-        if (!hit) {
-            for (var j: int = 0; j < node.shorthands.length; j = j + 1) {
-                if (matchesShorthand(node.shorthands[j], cp)) { hit = true; break }
-            }
+        for (var j: int = 0; j < node.shorthands.length; j = j + 1) {
+            if (matchesShorthand(node.shorthands[j], cp)) { return true }
+        }
+        return false
+    }
+
+    function classMatches(node: Node, cp: int): bool {
+        var hit: bool = classMatchesRaw(node, cp)
+        if (!hit && node.ci) {
+            var other: int = swapCase(cp)
+            if (other >= 0) { hit = classMatchesRaw(node, other) }
         }
         if (node.negate) { return !hit }
         return hit
@@ -471,7 +630,11 @@ class Parser {
         public match(node: Node, pos: int, cont: function(int): bool): bool {
             var k: string = node.kind
             if (k == "char") {
-                if (pos < this._n && this.codeAt(pos) == node.cp) { return cont(pos + 1) }
+                if (pos < this._n) {
+                    var cp: int = this.codeAt(pos)
+                    var hit: bool = node.ci ? (foldCase(cp) == foldCase(node.cp)) : (cp == node.cp)
+                    if (hit) { return cont(pos + 1) }
+                }
                 return false
             }
             if (k == "any") {

@@ -1,6 +1,6 @@
 {
   "name": "@chuks/pcre",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pure-Chuks PCRE-style backtracking regular expressions — lookahead, lookbehind, backreferences, named groups, lazy quantifiers — with position-returning matches. The advanced engine Chuks's RE2-based std/regex can't be (mirrors how Go ships RE2 in std and leaves regexp2 as a package).",
   "entry": "src/index.chuks",
   "author": "Chuks Team",

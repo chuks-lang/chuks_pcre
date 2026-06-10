@@ -46,6 +46,10 @@ if (m != null) {
 | Anchors         | `^ $`, `\b \B`, `\A \z`, `\G` (search-start anchor — TextMate's friend) |
 | Backreferences  | numeric `\1`…`\99`, named `\k<name>`                                    |
 | Lookaround      | lookahead `(?=…)` `(?!…)`, lookbehind `(?<=…)` `(?<!…)`                 |
+| Groups (extra)  | atomic `(?>…)` (≈ non-capturing), possessive `a++ a*+`                  |
+| Inline flags    | `(?i)` `(?i:…)` case-insensitive · `(?x)` `(?x:…)` extended/verbose (whitespace + `#` comments ignored) · `m s U` parsed |
+| Hex / unicode   | `\xHH`, `\x{H…}`, `\uHHHH`                                              |
+| POSIX classes   | `[[:alnum:]]` `[[:digit:]]` `[[:space:]]` … inside `[ … ]`              |
 
 ## API
 
@@ -96,7 +100,7 @@ chuks run tests/index.test.chuks      # VM
 chuks build tests/index.test.chuks -o /tmp/t && /tmp/t   # AOT
 ```
 
-50 assertions, green on both the bytecode VM and the AOT native backend.
+70 assertions, green on both the bytecode VM and the AOT native backend.
 
 ## License
 

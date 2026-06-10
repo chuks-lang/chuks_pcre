@@ -116,4 +116,30 @@ var toks: []Match = new Regex("\\d+|[+\\-*/]|\\w+").findAll("foo + 42 * bar")
 eq("tokenize-count", string(toks.length), "5")
 eq("tokenize-2", toks[2].matched(), "42")
 
+// oniguruma constructs real TextMate grammars use ---------------------------
+eq("atomic-group", first("(?>abc)d", "abcd"), "abcd")          // (?>…) ≈ non-capturing
+eq("atomic-grp1", grp("(?>(a+))b", "aaab", 1), "aaa")
+eq("possessive-plus", first("a++b", "aaab"), "aaab")           // a++ ≈ a+
+eq("possessive-star", first("\\d*+px", "12px"), "12px")
+eq("ci-global", first("(?i)hello", "HELLO world"), "HELLO")    // inline (?i)
+ok("ci-global-test", new Regex("(?i)cat").test("CaT"))
+eq("ci-scoped", first("(?i:foo)bar", "FOObar"), "FOObar")      // scoped (?i:…)
+ok("ci-scoped-bound", !new Regex("(?i:foo)bar").test("FOOBAR")) // bar is case-sensitive
+eq("ci-class", first("(?i)[a-f]+", "AbCxz"), "AbC")            // class respects (?i)
+ok("flags-ignored", new Regex("(?m)^line").test("line"))       // (?m) parsed, not fatal
+
+// hex / unicode escapes -------------------------------------------------------
+eq("hex-x", first("\\x41\\x42", "ABC"), "AB")                  // \x41=A \x42=B
+eq("hex-brace", first("\\x{48}i", "Hi"), "Hi")                 // \x{48}=H
+eq("hex-u", first("\\u0041", "A"), "A")
+ok("hex-class-nonascii", !new Regex("[^\\x00-\\x7F]").test("abc"))  // ASCII not matched
+ok("hex-class-ascii-neg", new Regex("[^\\x00-\\x7F]").test("café")) // é is non-ASCII
+eq("hex-range", first("[\\x30-\\x39]+", "ab123"), "123")       // \x30-\x39 = 0-9
+
+// extended/verbose mode -------------------------------------------------------
+eq("x-mode-ws", first("(?x) a b c", "abc"), "abc")             // whitespace ignored
+eq("x-mode-comment", first("(?x) a # the letter a\n b", "ab"), "ab")   // real newline ends comment
+eq("x-mode-alt", first("(?xi)\n  cat # animal\n  | dog", "DOG"), "DOG")
+eq("x-scoped", first("(?x: a b )c", "abc"), "abc")
+
 test.report(passed, failed, failures, test.now() - start)
