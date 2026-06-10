@@ -1,0 +1,681 @@
+// @chuks/pcre — a PCRE-style backtracking regular-expression engine, 100% pure Chuks.
+//
+// Chuks's std/regex is RE2 (linear-time, but no lookaround / backreferences),
+// This package is the backtracking counterpart —
+// the advanced engine, shipped as a package, mirroring how dlclark/regexp2 sits
+// outside Go's std. It powers anything that needs real PCRE/Oniguruma features
+// (e.g. running TextMate grammars for syntax highlighting).
+//
+// Supported: literals · escapes (\d \D \w \W \s \S \b \B \n \t \r \f \v \0,
+    // escaped metachars) · character classes [a-z] [^...] with shorthands inside ·
+// `.` · quantifiers * + ? {n} {n,} {n,m} and their lazy *? +? ?? {n,m}? forms ·
+// groups (capturing, (?:non-capturing), (?<name>named)) · alternation `|` ·
+// anchors ^ $ \b \B \A \z · backreferences \1..\99 and \k<name> · lookahead
+// (?=...) (?!...) · lookbehind (?<=...) (?<!...).
+//
+//   import { Regex } from "pkg/@chuks/pcre"
+//   var re = new Regex("(\\w+)@(\\w+)")
+//   var m = re.find("ada@chuks", 0)
+//   if (m != null) { println(m.group(1)) }   // "ada"
+
+import { strings } from "std/strings"
+
+// ─── AST ─────────────────────────────────────────────────────────────────────
+
+// A single regex AST node. One flexible class (rather than a subclass per kind)
+// keeps the tree easy to build and walk; `kind` selects which fields are live.
+class Node {
+    var kind: string          // char|any|class|esc|concat|alt|repeat|group|anchor|backref|look
+    var cp: int               // codepoint (kind=char)
+    var children: []Node      // concat / alt members
+    var child: Node?          // repeat / group / look body
+    var min: int              // repeat lower bound
+    var max: int              // repeat upper bound (-1 = unbounded)
+    var greedy: bool
+    var capturing: bool
+    var groupNum: int
+    var name: string          // named group / named backref
+    var atype: string         // anchor type: ^ $ \b \B \A \z
+    var ltype: string         // look type: ahead+ ahead- behind+ behind-
+    var negate: bool          // negated class / (unused elsewhere)
+    var ranges: []int         // class: flattened [lo,hi,lo,hi,...] codepoints
+    var shorthands: []string  // class-internal shorthands: d D w W s S
+    var escCls: string        // kind=esc shorthand: d D w W s S
+    var backrefNum: int
+    var backrefName: string
+
+    constructor(kind: string) {
+        this.kind = kind
+        this.cp = 0
+        this.children = []
+        this.child = null
+        this.min = 0
+        this.max = -1
+        this.greedy = true
+        this.capturing = false
+        this.groupNum = 0
+        this.name = ""
+        this.atype = ""
+        this.ltype = ""
+        this.negate = false
+        this.ranges = []
+        this.shorthands = []
+        this.escCls = ""
+        this.backrefNum = 0
+        this.backrefName = ""
+    }
+}
+
+// ─── Parser ──────────────────────────────────────────────────────────────────
+
+class Parser {
+    var _p: string
+    var _n: int
+    var _pos: int
+    var _groupCount: int
+    var _names: map[string]int   // named-group name → number
+
+    constructor(pattern: string) {
+        this._p = pattern
+        this._n = pattern.length
+        this._pos = 0
+        this._groupCount = 0
+        this._names = {}
+    }
+
+    public groupCount(): int { return this._groupCount }
+    public names(): map[string]int { return this._names }
+
+    private peek(): string {
+        if (this._pos >= this._n) { return "" }
+        return strings.charAt(this._p, this._pos)
+    }
+    private peekCode(): int {
+        if (this._pos >= this._n) { return -1 }
+        return strings.charCodeAt(this._p, this._pos)
+    }
+    private next(): string {
+        var c: string = this.peek()
+        this._pos = this._pos + 1
+        return c
+    }
+    private eof(): bool { return this._pos >= this._n }
+
+    // Top: alternation of concatenations.
+    public parse(): Node {
+        var node: Node = this.parseAlt()
+        if (!this.eof()) { throw new Error("regex: unexpected '" + this.peek() + "' at " + string(this._pos)) }
+        return node
+    }
+
+    private parseAlt(): Node {
+        var branches: []Node = [this.parseConcat()]
+        while (this.peek() == "|") {
+            this.next()
+            branches.push(this.parseConcat())
+        }
+        if (branches.length == 1) { return branches[0] }
+        var alt: Node = new Node("alt")
+        alt.children = branches
+        return alt
+    }
+
+    private parseConcat(): Node {
+        var items: []Node = []
+        while (!this.eof() && this.peek() != "|" && this.peek() != ")") {
+            items.push(this.parseQuantified())
+        }
+        if (items.length == 1) { return items[0] }
+        var cat: Node = new Node("concat")
+        cat.children = items
+        return cat
+    }
+
+    private parseQuantified(): Node {
+        var atom: Node = this.parseAtom()
+        var c: string = this.peek()
+        if (c == "*" || c == "+" || c == "?") {
+            this.next()
+            var rep: Node = new Node("repeat")
+            rep.child = atom
+            if (c == "*") { rep.min = 0; rep.max = -1 }
+            else if (c == "+") { rep.min = 1; rep.max = -1 }
+            else { rep.min = 0; rep.max = 1 }
+            rep.greedy = this.consumeLazy()
+            return rep
+        }
+        if (c == "{") {
+            var saved: int = this._pos
+            var rep2: Node? = this.tryParseBrace(atom)
+            if (rep2 != null) { return rep2 }
+            this._pos = saved   // not a valid {..}; treat '{' as a literal
+            }
+            return atom
+        }
+
+        // Returns false if a lazy '?' follows (greedy=false), true otherwise.
+        private consumeLazy(): bool {
+            if (this.peek() == "?") { this.next(); return false }
+            return true
+        }
+
+        private tryParseBrace(atom: Node): Node? {
+            this.next() // consume '{'
+                var minStr: string = this.readDigits()
+                if (minStr == "" && this.peek() != ",") { return null }
+                var minV: int = minStr == "" ? 0 : int(minStr)
+                var maxV: int = minV
+                if (this.peek() == ",") {
+                    this.next()
+                    var maxStr: string = this.readDigits()
+                    maxV = maxStr == "" ? -1 : int(maxStr)
+                }
+                if (this.peek() != "}") { return null }
+            this.next() // consume '}'
+        var rep: Node = new Node("repeat")
+        rep.child = atom
+        rep.min = minV
+        rep.max = maxV
+        rep.greedy = this.consumeLazy()
+        return rep
+    }
+
+    private readDigits(): string {
+        var out: string = ""
+        while (!this.eof()) {
+            var c: string = this.peek()
+            if (c >= "0" && c <= "9") { out = out + c; this.next() } else { break }
+        }
+        return out
+    }
+
+    private parseAtom(): Node {
+        var c: string = this.peek()
+        if (c == "(") { return this.parseGroup() }
+            if (c == "[") { return this.parseClass() }
+                if (c == ".") { this.next(); return new Node("any") }
+                if (c == "^") { this.next(); return this.anchor("^") }
+                if (c == "$") { this.next(); return this.anchor("$") }
+                if (c == "\\") { return this.parseEscape() }
+                // literal char
+                this.next()
+                var lit: Node = new Node("char")
+                lit.cp = strings.charCodeAt(c, 0)
+                return lit
+            }
+
+            private anchor(t: string): Node {
+                var a: Node = new Node("anchor")
+                a.atype = t
+                return a
+            }
+
+            private parseGroup(): Node {
+                this.next() // '('
+                    var capturing: bool = true
+                    var name: string = ""
+                    var look: string = ""
+                    if (this.peek() == "?") {
+                        this.next()
+                        var c: string = this.peek()
+                        if (c == ":") { this.next(); capturing = false }
+                        else if (c == "=") { this.next(); look = "ahead+" }
+                        else if (c == "!") { this.next(); look = "ahead-" }
+                        else if (c == "<") {
+                            this.next()
+                            var c2: string = this.peek()
+                            if (c2 == "=") { this.next(); look = "behind+" }
+                            else if (c2 == "!") { this.next(); look = "behind-" }
+                            else { name = this.readName(); capturing = true }
+                        } else {
+                            throw new Error("regex: unsupported group '(?" + c + "'")
+                            }
+                        }
+                        var groupNum: int = 0
+                        if (look == "" && capturing) {
+                            this._groupCount = this._groupCount + 1
+                            groupNum = this._groupCount
+                            if (name != "") { this._names[name] = groupNum }
+                        }
+                        var body: Node = this.parseAlt()
+                        if (this.peek() != ")") { throw new Error("regex: missing ')'") }
+                this.next()
+                if (look != "") {
+                    var l: Node = new Node("look")
+                    l.child = body
+                    l.ltype = look
+                    return l
+                }
+                var g: Node = new Node("group")
+                g.child = body
+                g.capturing = capturing
+                g.groupNum = groupNum
+                g.name = name
+                return g
+            }
+
+            private readName(): string {
+                var out: string = ""
+                while (!this.eof() && this.peek() != ">") { out = out + this.next() }
+                if (this.peek() == ">") { this.next() }
+                return out
+            }
+
+            private parseEscape(): Node {
+                this.next() // backslash
+                if (this.eof()) { throw new Error("regex: trailing backslash") }
+                var c: string = this.peek()
+                // Shorthand classes.
+                if (c == "d" || c == "D" || c == "w" || c == "W" || c == "s" || c == "S") {
+                    this.next()
+                    var e: Node = new Node("esc")
+                    e.escCls = c
+                    return e
+                }
+                // Word boundaries / string anchors.
+                if (c == "b") { this.next(); return this.anchor("\\b") }
+                if (c == "B") { this.next(); return this.anchor("\\B") }
+                if (c == "A") { this.next(); return this.anchor("\\A") }
+                if (c == "z") { this.next(); return this.anchor("\\z") }
+                if (c == "G") { this.next(); return this.anchor("\\G") }
+                // Named backreference \k<name>.
+                if (c == "k" && this.peekAt(1) == "<") {
+                    this.next(); this.next()
+                    var nm: string = this.readName()
+                    var br: Node = new Node("backref")
+                    br.backrefName = nm
+                    return br
+                }
+                // Numeric backreference \1..\99.
+                if (c >= "1" && c <= "9") {
+                    var num: string = this.readDigits()
+                    var brn: Node = new Node("backref")
+                    brn.backrefNum = int(num)
+                    return brn
+                }
+                // Control escapes → literal codepoints.
+                this.next()
+                var lit: Node = new Node("char")
+                lit.cp = this.escCodepoint(c)
+                return lit
+            }
+
+            private peekAt(off: int): string {
+                var i: int = this._pos + off
+                if (i >= this._n) { return "" }
+                return strings.charAt(this._p, i)
+            }
+
+            private escCodepoint(c: string): int {
+                if (c == "n") { return 10 }
+                if (c == "t") { return 9 }
+                if (c == "r") { return 13 }
+                if (c == "f") { return 12 }
+                if (c == "v") { return 11 }
+                if (c == "0") { return 0 }
+                return strings.charCodeAt(c, 0)   // escaped metachar → itself
+            }
+
+            // Character class: [ ... ] with ranges, singles, shorthands, negation.
+            private parseClass(): Node {
+                this.next() // '['
+                    var node: Node = new Node("class")
+                    if (this.peek() == "^") { this.next(); node.negate = true }
+                    var ranges: []int = []
+                    var shorthands: []string = []
+                    // A leading ']' is a literal.
+                var first: bool = true
+                while (!this.eof() && (this.peek() != "]" || first)) {
+                    first = false
+                    var lo: int = this.readClassAtom(shorthands)
+                    if (lo < 0) { continue }   // a shorthand was consumed
+                    if (this.peek() == "-" && this.peekAt(1) != "]" && this.peekAt(1) != "") {
+                        this.next() // '-'
+                        var hi: int = this.readClassAtom(shorthands)
+                        if (hi < 0) { ranges.push(lo); ranges.push(lo); ranges.push(45); ranges.push(45) }
+                        else { ranges.push(lo); ranges.push(hi) }
+                    } else {
+                        ranges.push(lo); ranges.push(lo)
+                    }
+                }
+                if (this.peek() == "]") { this.next() }
+            node.ranges = ranges
+            node.shorthands = shorthands
+            return node
+        }
+
+        // Reads one class member. Returns its codepoint, or -1 when it consumed a
+        // shorthand (\d etc., appended to `shorthands`).
+        private readClassAtom(shorthands: []string): int {
+            var c: string = this.peek()
+            if (c == "\\") {
+                this.next()
+                var e: string = this.peek()
+                if (e == "d" || e == "D" || e == "w" || e == "W" || e == "s" || e == "S") {
+                    this.next(); shorthands.push(e); return -1
+                }
+                this.next()
+                return this.escCodepoint(e)
+            }
+            this.next()
+            return strings.charCodeAt(c, 0)
+        }
+    }
+
+    // ─── Match result ────────────────────────────────────────────────────────────
+
+    export class Match {
+        var _str: string
+        var _caps: []int          // [g0s,g0e, g1s,g1e, ...]; -1 = unmatched
+        var _names: map[string]int
+
+        constructor(str: string, caps: []int, names: map[string]int) {
+            this._str = str
+            this._caps = caps
+            this._names = names
+        }
+
+        // Start/end rune offsets of the whole match.
+        public start(): int { return this._caps[0] }
+        public end(): int { return this._caps[1] }
+        public matched(): string { return this.group(0) }
+
+        // Number of capturing groups (excluding group 0).
+        public groupCount(): int { return this._caps.length / 2 - 1 }
+
+        // Text of capture group `i` (0 = whole match), or "" if it didn't participate.
+        public group(i: int): string {
+            var s: int = i * 2
+            if (s + 1 >= this._caps.length) { return "" }
+            var a: int = this._caps[s]
+            var b: int = this._caps[s + 1]
+            if (a < 0 || b < 0) { return "" }
+            return strings.substring(this._str, a, b)
+        }
+
+        // [start, end] rune offsets of group `i`, or [-1,-1] if absent.
+        public span(i: int): []int {
+            var s: int = i * 2
+            if (s + 1 >= this._caps.length) { return [-1, -1] }
+            return [this._caps[s], this._caps[s + 1]]
+        }
+
+        public groupByName(name: string): string {
+            var num: int? = this._names.get(name)
+            if (num == null) { return "" }
+            return this.group(num)
+        }
+    }
+
+    // ─── Matcher (continuation-passing backtracking) ─────────────────────────────
+    // match(node, pos, cont): returns true once the WHOLE pattern has matched. Each
+    // node tries every way it can match starting at `pos`, invoking `cont` (which
+        // matches the rest of the pattern) for each; success short-circuits. Captures
+    // live in the shared `caps` array, saved/restored across backtracking.
+
+    function isWordCode(cp: int): bool {
+        return (cp >= 48 && cp <= 57) || (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122) || cp == 95
+    }
+
+    function matchesShorthand(cls: string, cp: int): bool {
+        if (cls == "d") { return cp >= 48 && cp <= 57 }
+        if (cls == "D") { return !(cp >= 48 && cp <= 57) }
+        if (cls == "w") { return isWordCode(cp) }
+        if (cls == "W") { return !isWordCode(cp) }
+        if (cls == "s") { return cp == 32 || cp == 9 || cp == 10 || cp == 13 || cp == 12 || cp == 11 }
+        if (cls == "S") { return !(cp == 32 || cp == 9 || cp == 10 || cp == 13 || cp == 12 || cp == 11) }
+        return false
+    }
+
+    function classMatches(node: Node, cp: int): bool {
+        var hit: bool = false
+        var r: []int = node.ranges
+        var i: int = 0
+        while (i < r.length) {
+            if (cp >= r[i] && cp <= r[i + 1]) { hit = true; break }
+            i = i + 2
+        }
+        if (!hit) {
+            for (var j: int = 0; j < node.shorthands.length; j = j + 1) {
+                if (matchesShorthand(node.shorthands[j], cp)) { hit = true; break }
+            }
+        }
+        if (node.negate) { return !hit }
+        return hit
+    }
+
+    class Matcher {
+        var _str: string
+        var _n: int
+        var _caps: []int
+        var _anchorPos: int   // where \G matches (the search-start position)
+        var _names: map[string]int
+
+        constructor(str: string, groupCount: int, anchorPos: int, names: map[string]int) {
+            this._str = str
+            this._n = str.length
+            this._anchorPos = anchorPos
+            this._names = names
+            this._caps = []
+            var total: int = (groupCount + 1) * 2
+            for (var i: int = 0; i < total; i = i + 1) { this._caps.push(-1) }
+        }
+
+        public caps(): []int { return this._caps }
+
+        private codeAt(pos: int): int {
+            if (pos < 0 || pos >= this._n) { return -1 }
+            return strings.charCodeAt(this._str, pos)
+        }
+
+        public match(node: Node, pos: int, cont: function(int): bool): bool {
+            var k: string = node.kind
+            if (k == "char") {
+                if (pos < this._n && this.codeAt(pos) == node.cp) { return cont(pos + 1) }
+                return false
+            }
+            if (k == "any") {
+                if (pos < this._n && this.codeAt(pos) != 10) { return cont(pos + 1) }
+                return false
+            }
+            if (k == "esc") {
+                if (pos < this._n && matchesShorthand(node.escCls, this.codeAt(pos))) { return cont(pos + 1) }
+                return false
+            }
+            if (k == "class") {
+                if (pos < this._n && classMatches(node, this.codeAt(pos))) { return cont(pos + 1) }
+                return false
+            }
+            if (k == "concat") { return this.matchSeq(node.children, 0, pos, cont) }
+            if (k == "alt") {
+                for (var i: int = 0; i < node.children.length; i = i + 1) {
+                    if (this.match(node.children[i], pos, cont)) { return true }
+                }
+                return false
+            }
+            if (k == "anchor") { return this.matchAnchor(node, pos, cont) }
+            if (k == "group") { return this.matchGroup(node, pos, cont) }
+            if (k == "repeat") {
+                var rc: Node? = node.child
+                if (rc == null) { return false }
+                var child: Node = rc
+                return this.matchRepeat(child, node.min, node.max, node.greedy, pos, 0, cont)
+            }
+            if (k == "backref") { return this.matchBackref(node, pos, cont) }
+            if (k == "look") { return this.matchLook(node, pos, cont) }
+            return false
+        }
+
+        private matchSeq(nodes: []Node, idx: int, pos: int, cont: function(int): bool): bool {
+            if (idx >= nodes.length) { return cont(pos) }
+            return this.match(nodes[idx], pos, function(p: int): bool {
+                return this.matchSeq(nodes, idx + 1, p, cont)
+            })
+        }
+
+        private matchAnchor(node: Node, pos: int, cont: function(int): bool): bool {
+            var t: string = node.atype
+            var ok: bool = false
+            if (t == "^" || t == "\\A") { ok = (pos == 0) }
+            else if (t == "$" || t == "\\z") { ok = (pos == this._n) }
+            else if (t == "\\G") { ok = (pos == this._anchorPos) }
+            else if (t == "\\b" || t == "\\B") {
+                var before: bool = pos > 0 && isWordCode(this.codeAt(pos - 1))
+                var after: bool = pos < this._n && isWordCode(this.codeAt(pos))
+                var boundary: bool = before != after
+                ok = (t == "\\b") ? boundary : !boundary
+            }
+            if (ok) { return cont(pos) }
+            return false
+        }
+
+        private matchGroup(node: Node, pos: int, cont: function(int): bool): bool {
+            var bodyOpt: Node? = node.child
+            if (bodyOpt == null) { return false }
+            var body: Node = bodyOpt
+            if (!node.capturing) { return this.match(body, pos, cont) }
+            var g: int = node.groupNum
+            var caps: []int = this._caps
+            var savedS: int = caps[g * 2]
+            var savedE: int = caps[g * 2 + 1]
+            caps[g * 2] = pos
+            var ok: bool = this.match(body, pos, function(p: int): bool {
+                var oldE: int = caps[g * 2 + 1]
+                caps[g * 2 + 1] = p
+                if (cont(p)) { return true }
+                caps[g * 2 + 1] = oldE
+                return false
+            })
+            if (!ok) { caps[g * 2] = savedS; caps[g * 2 + 1] = savedE }
+            return ok
+        }
+
+        private matchRepeat(child: Node, min: int, max: int, greedy: bool, pos: int, count: int, cont: function(int): bool): bool {
+            // Still below the required minimum: must take one more.
+            if (count < min) {
+                return this.match(child, pos, function(p: int): bool {
+                    if (p == pos && count + 1 >= min) { return false }   // empty-match progress guard
+                    return this.matchRepeat(child, min, max, greedy, p, count + 1, cont)
+                })
+            }
+            var canMore: bool = (max < 0 || count < max)
+            if (greedy) {
+                if (canMore) {
+                    var expanded: bool = this.match(child, pos, function(p: int): bool {
+                        if (p == pos) { return false }   // no infinite empty loop
+                        return this.matchRepeat(child, min, max, greedy, p, count + 1, cont)
+                    })
+                    if (expanded) { return true }
+                }
+                return cont(pos)
+            }
+            // lazy: try to stop first, then expand.
+            if (cont(pos)) { return true }
+            if (canMore) {
+                return this.match(child, pos, function(p: int): bool {
+                    if (p == pos) { return false }
+                    return this.matchRepeat(child, min, max, greedy, p, count + 1, cont)
+                })
+            }
+            return false
+        }
+
+        private matchBackref(node: Node, pos: int, cont: function(int): bool): bool {
+            var g: int = node.backrefNum
+            if (node.backrefName != "") {
+                var num: int? = this._names.get(node.backrefName)
+                if (num == null) { return false }
+                g = num
+            }
+            if (g <= 0 || g * 2 + 1 >= this._caps.length) { return false }
+            var a: int = this._caps[g * 2]
+            var b: int = this._caps[g * 2 + 1]
+            if (a < 0 || b < 0) { return cont(pos) }   // group didn't participate → empty
+            var len: int = b - a
+            if (pos + len > this._n) { return false }
+            for (var i: int = 0; i < len; i = i + 1) {
+                if (this.codeAt(pos + i) != this.codeAt(a + i)) { return false }
+            }
+            return cont(pos + len)
+        }
+
+        private matchLook(node: Node, pos: int, cont: function(int): bool): bool {
+            var t: string = node.ltype
+            var lc: Node? = node.child
+            if (lc == null) { return false }
+            var child: Node = lc
+            if (t == "ahead+" || t == "ahead-") {
+                var matched: bool = this.match(child, pos, function(_p: int): bool { return true })
+                var pass: bool = (t == "ahead+") ? matched : !matched
+                if (pass) { return cont(pos) }
+                return false
+            }
+            // Lookbehind: the body must match some span ENDING exactly at pos. Try
+            // every start s ≤ pos. (Simple and correct; fine for typical patterns.)
+            var found: bool = false
+            var s: int = pos
+            while (s >= 0) {
+                if (this.match(child, s, function(p: int): bool { return p == pos })) { found = true; break }
+                s = s - 1
+            }
+            var pass2: bool = (t == "behind+") ? found : !found
+            if (pass2) { return cont(pos) }
+            return false
+        }
+    }
+
+    // ─── Public API ──────────────────────────────────────────────────────────────
+
+    export class Regex {
+        var _ast: Node
+        var _groupCount: int
+        var _names: map[string]int
+        var _source: string
+
+        constructor(pattern: string) {
+            var parser: Parser = new Parser(pattern)
+            this._ast = parser.parse()
+            this._groupCount = parser.groupCount()
+            this._names = parser.names()
+            this._source = pattern
+        }
+
+        public source(): string { return this._source }
+        public groupCount(): int { return this._groupCount }
+
+        // Leftmost match at or after `startPos` (rune index). Returns null if none.
+        public find(str: string, startPos: int): Match? {
+            var n: int = str.length
+            var begin: int = startPos < 0 ? 0 : startPos
+            for (var i: int = begin; i <= n; i = i + 1) {
+                var m: Matcher = new Matcher(str, this._groupCount, begin, this._names)
+                var endCell: []int = [-1]
+                var ok: bool = m.match(this._ast, i, function(p: int): bool { endCell[0] = p; return true })
+                if (ok) {
+                    var caps: []int = m.caps()
+                    caps[0] = i
+                    caps[1] = endCell[0]
+                    return new Match(str, caps, this._names)
+                }
+            }
+            return null
+        }
+
+        // Whether the pattern matches anywhere in `str`.
+        public test(str: string): bool { return this.find(str, 0) != null }
+
+        // All non-overlapping matches from left to right.
+        public findAll(str: string): []Match {
+            var out: []Match = []
+            var pos: int = 0
+            var n: int = str.length
+            while (pos <= n) {
+                var m: Match? = this.find(str, pos)
+                if (m == null) { break }
+                out.push(m)
+                var e: int = m.end()
+                pos = (e > pos) ? e : pos + 1   // advance past empty matches
+            }
+            return out
+        }
+    }
